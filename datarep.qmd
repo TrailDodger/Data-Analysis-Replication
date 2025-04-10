@@ -1,0 +1,322 @@
+---
+title: "Data Replication"
+format: html
+editor: visual
+---
+
+### In this assignment, I will be replicating the analysis conducted in Morato et al (2016) where researchers explore movement and range size for a population of Jaguars in Brazil and Argentina
+
+### A Brief overview of the paper
+
+The Morato et al (2016) paper uses a dataset with GPS locations for collared jaguars in Brazil and Argentina. The premise of the paper is to improve upon methods for estimating home range as a methodological approach in ecology. To accomplish this, authors calculate the autocorrelated kernel density estimator and the kernel density estimates for each individual, identifying that AKDE produced higher home range estimates than KDE (which does not consider autocorrelation).
+
+Authors also assess different movement parameters, including distance traveled per day, velocity timescale, and average speed. The inferences derived from these calculation based on differences between the sexes are replicated here. Also considered are per biome habitat parameters, though this assignment does not include replication for those calculations or visualizations. Another component of the paper not replicated here is an analysis of home range and movement against variables considering habitat loss or human population density.
+
+In keeping with the original paper, a one way ANOVA test is conduced to determine those differences in home range size and movement parameters between male and female jaguars.
+
+The paper concludes that AKDE produces better home range estimates than KDE; there are significant differences in movement behavior and space use between male and female jaguars; there are significant differences in home range size and movement parameters between the different regions in the dataset. Within those conclusions, males have larger home range sizes than females, human disturbances impacts habitat use in that individuals have larger home range sizes in areas of increased disturbance. These results are significant for informing conservation action of an endangered species.
+
+First, I will load in the packages and data. Please excuse a couple of messy chunks incoming! I will mark where the descriptive statistics begin.
+
+```{r}
+library(rjags)
+library(coda)
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(ggplot2)
+```
+
+```{r}
+library(lubridate)
+```
+
+```{r}
+library(ctmm)
+```
+
+```{r}
+library(readxl)
+```
+
+```{r}
+getwd()
+```
+
+```{r}
+data <- read_excel("Data-Analysis-Replication/my_new_folder/Movement ecology of the jaguar in the largest floodplain of the world, the Brazilian Pantanal.xlsx")
+```
+
+```{r}
+head(data)
+```
+
+```{r}
+head(unique(data$timestamp), 10)
+```
+
+```{r}
+?as.telemetry
+```
+
+## Descriptive statistics
+
+For ease of coding, I am marking the unique individuals as a new variable "jaguar", and creating an empty list to populate once my for loop runs. Here, I am using the ctmm package to replicate the following from my reference paper: "We calculated variograms, fit movement models, and estimated home ranges". My code chunk will iterate through all the individuals in the dataset to generate those values for the individuals in the dataset. Once complete, this will have produced the foundation for my next two steps, which will comprise:
+
+Visualization statistic : semivariance plots
+
+Inferential statistic: testing differences in HR across sex using one-way ANOVA
+
+```{r}
+(jaguars <- unique(data$individual.local.identifier))
+```
+
+```{r}
+results_list <- list()
+
+for (id in jaguars) {
+  cat("\nProcessing:", id, "\n")
+
+  indiv_data <- data |>
+    filter(`individual.local.identifier` == id) |>
+    arrange(timestamp)
+
+  telemetry_data <- as.telemetry(data.frame(
+    timestamp = indiv_data$timestamp,
+    latitude = indiv_data$location.lat,
+    longitude = indiv_data$location.long,
+    id = indiv_data$`individual.local.identifier`
+  ))
+
+  GUESS <- ctmm.guess(telemetry_data, interactive = FALSE)
+  FIT <- ctmm.select(telemetry_data, GUESS, verbose = FALSE)
+
+  UD <- akde(telemetry_data, FIT)
+  HR_area <- summary(UD)$CI[2]  
+
+  results_list[[id]] <- list(
+    model = FIT,
+    home_range = HR_area
+  )
+}
+```
+
+```{r}
+hr_summary <- data.frame(
+  ID = names(results_list),
+  HomeRange_km2 = sapply(results_list, function(x) x$home_range)
+)
+print(hr_summary)
+```
+
+Please note that the Malagra et al paper specifies this approach, stating "Models were fit via maximum likelihood (function ctmm.fit) \[28\] and ranked based on AICc \[43\] (function ctmm.select) \[25\]. We estimated home range conditional on the fitted, selected model for each individual using the akde function." My code uses the ctmm.select() function, which calls ctmm.fit AND ctmm.select, and is functionally the same as the authors approach to HR calculation.
+
+So, in my descriptive statistics section, I fit and ranked the models using the ctmm package and calculated home range using AKDE. In their inferential statistics, the authors do compare the AKDE and KDE home range outputs, where AKDE is an auto-correlated kernel density estimator and KDE is kernel density estimator. For this assignment, I'll just be looking at AKDE.
+
+### Inferential Statistics
+
+First, since the data is split into multiple sheets, one containing the movement data and the other containing demographic information of the individuals, I'll be specifying the sex of each jaguar.
+
+```{r}
+sex_map <- c(
+  "Picole" = "Male",
+  "Marrua" = "Female",
+  "Fiao" = "Male",
+  "Wendy" = "Female",
+  "Dale" = "Male",
+  "Daryl" = "Male",
+  "Linda" = "Female",
+  "Caiman" = "Male",
+  "Alice" = "Female",
+  "Fera" = "Female",
+  "Anderson" = "Male",
+  "Milagre" = "Male",
+  "Selema" = "Female"
+)
+```
+
+```{r}
+hr_summary$Gender <- sex_map[hr_summary$ID]
+```
+
+```{r}
+shapiro_results <- by(hr_summary$HomeRange_km2, hr_summary$Gender, shapiro.test)
+print(shapiro_results)
+```
+
+```{r}
+qqnorm(hr_summary$HomeRange_km2)
+qqline(hr_summary$HomeRange_km2)
+```
+
+```{r}
+hr_summary$log_HomeRange <- log(hr_summary$HomeRange_km2)
+shapiro_log <- by(hr_summary$log_HomeRange, hr_summary$Gender, shapiro.test)
+print(shapiro_log)
+```
+
+```{r}
+qqnorm(hr_summary$log_HomeRange)
+qqline(hr_summary$log_HomeRange)
+```
+
+The paper dictates that home range is log transformed, but I wanted to provide visuals of the normality violation as well!
+
+Now I will use the JAGS package, as specified in the study, to "compar(e) results using hierarchical Bayesian fixed-effect one-way ANOVAs".
+
+```{r}
+hr_data <- list(
+  log_HomeRange = hr_summary$log_HomeRange,
+  group = as.numeric(as.factor(hr_summary$Gender)),
+  N = nrow(hr_summary),
+  G = length(unique(hr_summary$Gender))
+)
+```
+
+```{r}
+jags_model <- jags.model(
+  file = textConnection(
+    "model {
+      for (i in 1:N) {
+        log_HomeRange[i] ~ dnorm(mu[group[i]], tau)
+      }
+      for (j in 1:G) {
+        mu[j] ~ dnorm(0, 0.01)
+      }
+      tau ~ dgamma(0.01, 0.01)
+      sigma <- 1 / sqrt(tau)
+    }"
+  ),
+  data = hr_data,
+  n.chains = 3
+)
+```
+
+```{r}
+update(jags_model, 20000) 
+samples <- coda.samples(jags_model, variable.names = c("mu", "sigma"), n.iter = 100000)
+```
+
+```{r}
+print(gelman.diag(samples))
+plot(samples)
+summary(samples)
+```
+
+```{r}
+samples_mat <- as.matrix(samples)
+
+P_male_gt_female <- mean(samples_mat[, "mu[2]"] > samples_mat[, "mu[1]"])
+print(P_male_gt_female)
+```
+
+That above metric was used in the paper as a probability for how likely it is that male jaguars have a larger home range size than female jaguars. From the paper: "We calculated the probability (P) that the mean of one group was greater than the other by sampling from each of the resulting posterior distributions (10,000 iterations)." The output above can be read as: there is an 80.5% posterior probability that male jaguars have a larger mean home range than female jaguars.
+
+After running that initial for loop, I returned to the paper and decided to do all four analyses for the sake of creating an exact replica of one of the figures. That updated for loop is below.
+
+What's interesting about this process, and what the paper explained quite well, is that the additional movement variables I attempt to calculate here (home range crossing time, average speed, velocity timescale) must be derived from tau position. Tau position is a temporally explicit calculation that represents the autocorrelation timescale of position. It is itself the home range size per individual. In the paper, they also visualize this using variograms, but that will not be a component of my visualization in this analysis. Rather, I am contending with the model selection process wherein the IID model fit does not generate tau position. That must be derived from OU (Ornstein- Uhlenbeck) or OUF (Ornstein-Uhlenbeck-F). So, in calculating those aforementioned movement variables, I (like the paper) will not actually be considering every individual in the dataset. I will only be using the individuals who's model fit was determined to be OU, wherein the model is determined by home range crossing time and variance, or an OUF, wherein the model is determined by home range crossing time, velocity autocorrelation timescale, and average distance traveled.
+
+```{r}
+updated_list <- list()
+
+for (id in jaguars) {
+  cat("\nProcessing:", id, "\n")
+
+  indiv_data <- data |>
+    filter(`individual.local.identifier` == id) |>
+    arrange(timestamp)
+
+  telemetry_data <- as.telemetry(data.frame(
+    timestamp = indiv_data$timestamp,
+    latitude = indiv_data$location.lat,
+    longitude = indiv_data$location.long,
+    id = indiv_data$`individual.local.identifier`
+  ))
+
+  GUESS <- ctmm.guess(telemetry_data, interactive = FALSE)
+  FIT <- ctmm.select(telemetry_data, GUESS, verbose = FALSE)
+
+  UD <- akde(telemetry_data, FIT)
+  HR_area <- summary(UD)$CI[2]  
+
+
+  CI <- summary(FIT)$CI
+  crossing_time <- if ("tau position" %in% rownames(CI)) CI["tau position", 2] / 86400 else NA
+  velocity_timescale <- if ("tau velocity" %in% rownames(CI)) CI["tau velocity", 2] / 3600 else NA
+  avg_speed <- mean(speed(telemetry_data, CTMM = FIT)) / 1000 * 86400
+
+  updated_list[[id]] <- list(
+    model = FIT,
+    model_name = FIT$name,
+    home_range = HR_area,
+    crossing_time = crossing_time,
+    velocity_timescale = velocity_timescale,
+    avg_speed = avg_speed
+  )
+}
+```
+
+```{r}
+(total_summary <- data.frame(
+  ID = names(updated_list),
+  HomeRange_km2 = sapply(updated_list, function(x) x$home_range),
+  CrossingTime_d = sapply(updated_list, function(x) x$crossing_time),
+  VelocityTimescale_h = sapply(updated_list, function(x) x$velocity_timescale),
+  AvgDistance_km_day = sapply(updated_list, function(x) x$avg_speed)
+))
+```
+
+So in my calculations, I am able to generate homerange using AKDE, but my ctmm.select() function did not seem to identify OU our OUF as the best model fit for any individual. This differs from the paper! Thankfully, I do have the home range analysis.
+
+## Visualization!
+
+The paper uses a box plot with gender and home range log transformed to demonstrate the differences in home range size.
+
+```{r}
+ggplot(hr_summary, aes(x = Gender, y = HomeRange_km2, fill = Gender)) +
+  geom_boxplot() +
+  labs(title = "Jaguar Home Range by Gender",
+       x = "Gender",
+       y = "Log Home Range (km^2)") +
+  theme_minimal()
+```
+
+For a secondary figure, I'll also produce variograms, which the paper uses to: "visually inspect the autocorrelation structure of the location data. At zero to short time lags, a linear increase in the semi-variance as a function of time lag to visually inspect the autocorrelation structure of the location data...a linear increase in the semivariance corresponds to uncorrelated velocy, suggesting brownian motion or ornstein-uhlenbeck."
+
+The paper generates two variograms, one for a resident jaguar and one for a non-resident jaguar without specifying which individual corresponds with each figure. As such, I will be producing a variogram on one resident individual in the dataset, Picole, and determining if the output looks like he is a resident or non-resident.
+
+```{r}
+picole_variogram <- data |>
+  filter(individual.local.identifier == "Picole")
+telemetry_picole <- as.telemetry(data.frame(
+  timestamp = picole_variogram$timestamp,
+  latitude = picole_variogram$location.lat,
+  longitude = picole_variogram$location.long
+))
+```
+
+```{r}
+picole <- variogram(telemetry_picole)
+plot(picole, CTMM = updated_list[["Picole"]]$model,
+     main = "Picole's Variogram")
+```
+
+Based on these results, I would assume that Picole is a non-resident. The lack of asymptote in this graphic is what would differentiate a non-resident from a resident, as resident individuals represented in a variogram will have a clear asymptote.
+
+```{r}
+picole_data <- data |>
+  filter(`individual.local.identifier` == "Picole")
+start_date <- min(picole_data$timestamp)
+end_date <- max(picole_data$timestamp)
+tracking_days <- as.numeric(difftime(end_date, start_date, units = "days"))
+
+cat("Picole was tracked for", round(tracking_days, 1), "days.\n")
+```
+
+In fact, having probed this a bit more, I believe Picole is the non-resident individual sampled in the paper! The authors specify that this individual was tracked for 591, and this matches the data for Picole.
+
+### Conclusion
+
+This replication was relatively successful! One issue I ran into was: inability to calculate additional movement variables due to model fitting. I believe that part of this, as well as some amount of variation in the box plot visualization, is because not all individuals in the dataset as its analyzed in the paper are available in the downloadable version. The only reason I am able to know this is that the paper states 33 individuals are included in the data, but the data I analyze here only has 13 individuals. So, my best guess is that the individuals whose movement fits the OU and OUF model that would allow for the calculation of the additional movement variables are not present here.
+
+Another variation is that the actual home range estimates vary slightly, though the actual figure generated in my akde calculation does fall within the range provided by the confidence intervals in the paper.
